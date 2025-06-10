@@ -1,0 +1,46 @@
+name: Update survey data (yearly)
+
+# ────────── ❶ トリガー ──────────
+on:
+  workflow_dispatch:          # 手動実行
+  schedule:
+    # 0 18 1 7 *  → 7月1日 18:00 (JST) = 09:00 UTC
+    - cron: '0 9 1 7 *'
+
+# ────────── ❷ ジョブ定義 ──────────
+jobs:
+  fetch-convert:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1) リポジトリをチェックアウト
+      - uses: actions/checkout@v4
+
+      # 2) Python セットアップ
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # 3) 依存ライブラリをインストール
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install beautifulsoup4 requests
+
+      # 4) Excel ダウンロード & 変換
+      - name: Fetch & convert survey excels
+        run: python scripts/fetch_and_convert.py
+
+      # 5) 変更があればコミットして push
+      - name: Commit & push if updated
+        run: |
+          git config --global user.name  "survey-bot"
+          git config --global user.email "bot@users.noreply.github.com"
+          git add data/raw
+          if git diff --cached --quiet; then
+            echo "No data changes."
+          else
+            git commit -m "chore: auto-update survey data (July 1)"
+            git push
+          fi

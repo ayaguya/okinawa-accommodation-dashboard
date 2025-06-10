@@ -1,46 +1,125 @@
 # app/excel_importer.py
+import sys
 from pathlib import Path
 import pandas as pd
-from app.type_map import TYPE_MASTER
+from app.type_map import TYPE_MASTER, normalize_accommodation_type
+from datetime import datetime
 
 ROOT    = Path(__file__).resolve().parent.parent
-RAW_DIR = ROOT / "data" / "raw"              # Excel も CSV もここに置く
+RAW_DIR = ROOT / "data" / "raw"
 
 def extract_type(name: str) -> str:
-    """行見出し(例: 'リゾートホテル(大規模)')から種別を返す"""
-    for key in TYPE_MASTER:
-        if key in name:
-            return TYPE_MASTER[key]
-    return "その他"
+    """
+    宿泊種別の抽出と正規化
+    
+    Args:
+        name (str): 入力された宿泊種別名
+        
+    Returns:
+        str: 正規化された宿泊種別
+    """
+    return normalize_accommodation_type(name)
 
 def tidy_sheet(df_raw: pd.DataFrame, year: int) -> pd.DataFrame:
+    """
+    Excelシートを整理し、必要なカラムのみを抽出
+    
+    Args:
+        df_raw (pd.DataFrame): 元のデータフレーム
+        year (int): 対象年
+        
+    Returns:
+        pd.DataFrame: 整理されたデータフレーム
+    """
+    # カラム名の正規化
     df = df_raw.copy()
-    df.iloc[:, :3] = df.iloc[:, :3].ffill()   # 地域・市町村前方埋め
-    df = df.rename(columns={df.columns[0]: "地域", df.columns[2]: "市町村"})
+    df.columns = df.columns.str.strip()
+    
+    # 必要なカラムの抽出
+    required_cols = ['年月', '宿泊種別', '宿泊者数', '宿泊施設数']
+    df = df[required_cols]
+    
+    # 宿泊種別の正規化
+    df['宿泊種別'] = df['宿泊種別'].apply(extract_type)
+    
+    # 数値カラムの型変換
+    numeric_cols = ['宿泊者数', '宿泊施設数']
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+        df[col] = df[col].fillna(0)
+    
+    # 日付カラムの型変換
+    df['年月'] = pd.to_datetime(df['年月'], format='%Y-%m')
+    
+    # 不要な行の削除
+    df = df.dropna(subset=['宿泊種別'])
+    
+    return df
 
-    # ── 種別・規模列を抽出 ─────────────────────────
-    df["宿泊種別"] = df.iloc[:, 3].map(extract_type)
-    df["規模"]   = df.iloc[:, 3].str.extract(r"（(.+?)）")[0].fillna("総計")
+def convert_excel(xlsx: Path, year: int) -> None:
+    """
+    Excelファイルを処理してCSVに変換
+    
+    Args:
+        xlsx (Path): Excelファイルのパス
+        year (int): 対象年
+    """
+    print(f"Processing: {xlsx}")
+    df_raw = pd.read_excel(xlsx)
+    df = tidy_sheet(df_raw, year)
+    
+    # CSVファイル名の生成
+    csv_file = RAW_DIR / f"accommodation_{year}.csv"
+    df.to_csv(csv_file, index=False, encoding='utf-8')
+    print(f"Saved to: {csv_file}")
 
-    # ── 必要列だけ残す ───────────────────────────
-    col_map = {"軒数": "軒数", "客 室 数": "客室数", "収容\n人数": "収容人数"}
-    df = df[list(col_map.keys()) + ["地域", "市町村", "宿泊種別", "規模"]]
+def load_all_data() -> pd.DataFrame:
+    """
+    全てのCSVファイルからデータを読み込み、結合
+    
+    Returns:
+        pd.DataFrame: 結合されたデータフレーム
+    """
+    all_data = []
+    
+    # 全てのCSVファイルを読み込む
+    for csv_file in RAW_DIR.glob("*.csv"):
+        try:
+            df = pd.read_csv(csv_file)
+            all_data.append(df)
+        except Exception as e:
+            print(f"Error reading {csv_file}: {str(e)}")
+    
+    if all_data:
+        # 全てのデータを結合
+        combined_df = pd.concat(all_data, ignore_index=True)
+        return combined_df
+    else:
+        raise ValueError("No data files found")
 
-    # ── ワイド→ロング ───────────────────────────
-    tidy = (df.rename(columns=col_map)
-              .melt(id_vars=["地域", "市町村", "宿泊種別", "規模"],
-                    var_name="指標", value_name="値"))
-    tidy["年"]  = year
-    tidy["値"] = (tidy["値"].astype(str)
-                            .str.replace(",", "")
-                            .replace("", 0)
-                            .astype("Int64"))
-    return tidy[["地域", "市町村", "年", "宿泊種別", "規模", "指標", "値"]]
+def get_latest_data() -> pd.DataFrame:
+    """
+    最新のデータを取得
+    
+    Returns:
+        pd.DataFrame: 最新のデータ
+    """
+    df = load_all_data()
+    latest_date = df['年月'].max()
+    return df[df['年月'] == latest_date]
 
-def convert_excel(xlsx: Path):
-    year = int(xlsx.stem.split("r")[1][:2]) + 2018  # R5 → 2023
-    sheet = (pd.ExcelFile(xlsx)
-               .parse("(1)市町村別・種別・規模別", header=3))
+def get_trend_data() -> pd.DataFrame:
+    """
+    トレンドデータを取得（過去12ヶ月分）
+    
+    Returns:
+        pd.DataFrame: トレンドデータ
+    """
+    df = load_all_data()
+    latest_date = df['年月'].max()
+    start_date = latest_date - pd.DateOffset(months=12)
+    return df[(df['年月'] >= start_date) & (df['年月'] <= latest_date)]
+    sheet = pd.ExcelFile(xlsx).parse("(1)市町村別・種別・規模別", header=3)
     tidy = tidy_sheet(sheet, year)
     out = RAW_DIR / f"survey_{year}.csv"
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -48,6 +127,15 @@ def convert_excel(xlsx: Path):
     print(f"✅ 生成: {out}")
 
 if __name__ == "__main__":
-    # Excel ファイル名を適宜書き換えてください
-    convert_excel(RAW_DIR / "沖縄県宿泊施設実態調査推移.xlsx")
+    if len(sys.argv) < 3:
+        print("Usage: python -m app.excel_importer <path/to/file.xlsx> <year>")
+        sys.exit(1)
 
+    xlsx_path = Path(sys.argv[1])
+    try:
+        year = int(sys.argv[2])
+    except ValueError:
+        print("Error: <year> must be an integer, e.g. 2023")
+        sys.exit(1)
+
+    convert_excel(xlsx_path, year)
