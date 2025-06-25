@@ -1,306 +1,280 @@
 """
 # okinawa_accommodation_dashboard.py
+# =============================================================
+# 沖縄県宿泊施設ダッシュボード  (H26〜R5)
 # -------------------------------------------------------------
-# 沖縄県宿泊施設ダッシュボード  (H30〜R5・Excel 自動取込版)
+# 1) Excel → long 変換         : convert_excels_to_long()
+# 2) long → clean & unify CSV  : clean_long_csvs()
+# 3) Streamlit ダッシュボード   : streamlit_main()
 # -------------------------------------------------------------
-# * Excel は data/raw/*.xlsx に保存（4 シート構成）
-# * サイドバーでエリア・市町村・年度・指標を柔軟に選択
-# * 軒数(折れ線) + 客室数/収容人数(積み上げ棒) の 2 軸表示
-# * 地域／市町村ごとの推移・データテーブル
-# * オプションで前年比増減数も計算
-#
-# 依存ライブラリ: streamlit, pandas, plotly, openpyxl
+# フォルダ構成 (プロジェクト直下)
+# ├─ data
+# │   ├─ raw/            … 元 Excel ファイル (H26〜R5)
+# │   ├─ processed/      … 変換後 long_YYYY.csv
+# │   └─ unified/        … all_years_long.csv (クリーン済)
+# └─ okinawa_accommodation_dashboard.py (本ファイル)
 """
 from pathlib import Path
-from functools import lru_cache
-import streamlit as st
 import pandas as pd
+import re
+import streamlit as st
 import plotly.graph_objects as go
+from app.type_map import METRIC_DISPLAY_NAMES, YEARS, YEAR_DISPLAY_NAMES, AREA_MAP
 
-# -----------------------------------------------------------------------------
-# 0. 定数・設定
-# -----------------------------------------------------------------------------
-DATA_DIR = Path(r"C:/Users/y-ham/CascadeProjects/okinawa-accommodation-dashboard/data/processed/all")
+# ディレクトリ設定
+DATA_DIR = Path(__file__).parent / "data"
+RAW_DIR = DATA_DIR / "raw"
+PROC_DIR = DATA_DIR / "processed"
+UNIFY_DIR = DATA_DIR / "unified"
 
-# データマップ
-METRIC_MAP = {
-    "施設数": "facilities",
-    "客室数": "rooms",
-    "収容人数": "capacity",
-    "届出数": "notifications"
-}
+# ディレクトリ作成
+for p in (PROC_DIR, UNIFY_DIR):
+    p.mkdir(parents=True, exist_ok=True)
 
-# エリア定義
-REGION_DEFS = {
-    "南部": ["那覇市", "糸満市", "豊見城市", "八重瀬町", "南城市", "与那原町", "南風原町"],
-    "中部": ["沖縄市", "宜野湾市", "浦添市", "うるま市", "読谷村", "嘉手納町", "北谷町", "北中城村", "中城村", "西原町"],
-    "北部": ["名護市", "国頭村", "大宜味村", "東村", "今帰仁村", "本部町", "恩納村", "宜野座村", "金武町"],
-    "宮古": ["宮古島市", "多良間村"],
-    "八重山": ["石垣市", "竹富町", "与那国町"],
-    "離島": ["久米島町", "渡嘉敷村", "座間味村", "粟国村", "渡名喜村", "南大東村", "北大東村", "伊江村", "伊平屋村", "伊是名村"]
-}
+# エリアマップ
+CITY_TO_AREA = {city: area for area, cities in AREA_MAP.items() for city in cities}
 
-# -----------------------------------------------------------------------------
-# 1. ストリームリット ページ設定
-# -----------------------------------------------------------------------------
-st.set_page_config(
-    page_title="沖縄県宿泊施設ダッシュボード",
-    page_icon="🏨",
-    layout="wide",
-)
+# ----------------------------
+# 1. Excel → long 変換
+# ----------------------------
+def jp_year_to_yyyy(tag: str) -> int | None:
+    """和暦/令和表記を西暦に変換"""
+    m = re.search(r"([rh])(\d{1,2})", tag.lower())
+    if not m:
+        return None
+    era, num = m.group(1), int(m.group(2))
+    return 1988 + num if era == "h" else 2018 + num  # H1=1989, R1=2019
 
-st.markdown("""
-<h1 style="text-align:center;">🏨 沖縄県宿泊施設データ<br>可視化ダッシュボード</h1>
-""", unsafe_allow_html=True)
-
-# -----------------------------------------------------------------------------
-# 2. データ読み込み
-# -----------------------------------------------------------------------------
-@lru_cache(maxsize=1)
-def load_data():
-    """処理済み CSV ファイルを読み込む"""
-    try:
-        df = pd.read_csv(DATA_DIR / "okinawa_accommodation_tidy.csv")
-    except Exception as e:
-        st.error(f"データ読み込みエラー: {e}")
-        st.stop()
-    return df
-
-raw_df = load_data()
-
-# -----------------------------------------------------------------------------
-# 3. データ加工
-# -----------------------------------------------------------------------------
-df_all = raw_df[raw_df["metric"].isin(METRIC_MAP.values())].copy()
-df_all["指標"] = df_all["metric"].map({v: k for k, v in METRIC_MAP.items()})
-YEARS = sorted(df_all["year"].unique())
-
-# 年度合計 (県全体表示用)
-agg_pref = (
-    df_all.groupby(["year", "指標"])["value"].sum()
-    .reset_index()
-    .pivot(index="year", columns="指標", values="value")
-)
-
-# -----------------------------------------------------------------------------
-# 4. サイドバー フィルタ
-# -----------------------------------------------------------------------------
-st.sidebar.header("データ選択")
-region_sel = st.sidebar.multiselect(
-    "エリアを選択してください",
-    options=list(REGION_DEFS.keys()),
-    default=list(REGION_DEFS.keys())
-)
-
-city_options = sorted(df_all["municipality"].unique())
-city_sel = st.sidebar.multiselect(
-    "市町村を選択してください",
-    options=city_options
-)
-
-min_year, max_year = st.sidebar.slider(
-    "期間を選択してください",
-    min_value=min(YEARS),
-    max_value=max(YEARS),
-    value=(min(YEARS), max(YEARS))
-)
-
-metric_multi = st.sidebar.multiselect(
-    "要素を選択してください",
-    options=list(METRIC_MAP.keys()),
-    default=["施設数"]
-)
-
-show_delta = st.sidebar.checkbox("増減数(前年比)を表示", value=True)
-
-# -----------------------------------------------------------------------------
-# 5. 沖縄県全体の状況
-# -----------------------------------------------------------------------------
-st.header("沖縄県全体の状況")
-
-fig_pref = go.Figure()
-
-# 客室数と収容人数の積み上げ棒グラフ
-if "客室数" in metric_multi:
-    fig_pref.add_trace(
-        go.Bar(
-            x=agg_pref.index,
-            y=agg_pref["客室数"],
-            name="客室数（室）",
-            marker_color="lightblue",
-            yaxis="y2"
-        )
-    )
-if "収容人数" in metric_multi:
-    fig_pref.add_trace(
-        go.Bar(
-            x=agg_pref.index,
-            y=agg_pref["収容人数"],
-            name="収容人数（人）",
-            marker_color="cornflowerblue",
-            yaxis="y2"
-        )
-    )
-
-# 軒数の折れ線グラフ
-if "施設数" in metric_multi:
-    fig_pref.add_trace(
-        go.Scatter(
-            x=agg_pref.index,
-            y=agg_pref["施設数"],
-            mode="lines+markers",
-            name="施設数（軒）",
-            line=dict(color="darkblue", width=2),
-            marker=dict(size=8),
-            yaxis="y1",
-            hovertemplate="年: %{x}<br>軒数: %{y:,}軒<extra></extra>"
-        )
-    )
-
-fig_pref.update_layout(
-    title="沖縄県宿泊施設推移状況",
-    xaxis=dict(title="年"),
-    yaxis=dict(
-        title="軒数（軒）",
-        titlefont=dict(color="darkblue"),
-        tickfont=dict(color="darkblue"),
-        showgrid=True
-    ),
-    yaxis2=dict(
-        title="客室数・収容人数",
-        titlefont=dict(color="cornflowerblue"),
-        tickfont=dict(color="cornflowerblue"),
-        overlaying="y",
-        side="right",
-        showgrid=False
-    ),
-    legend=dict(
-        orientation="h",
-        yanchor="bottom",
-        y=1.02,
-        xanchor="center",
-        x=0.5
-    ),
-    hovermode="x unified",
-    barmode="stack",
-    height=450
-)
-
-st.plotly_chart(fig_pref, use_container_width=True)
-
-# -----------------------------------------------------------------------------
-# 6. エリア別の状況
-# -----------------------------------------------------------------------------
-st.header("エリアの状況")
-if region_sel:
-    for metric in metric_multi:
-        st.subheader(f"選択エリアの{metric}の推移")
-        fig_reg = go.Figure()
-        tbl_reg = pd.DataFrame()
-
-        for reg in region_sel:
-            cities = REGION_DEFS[reg]
-            df_reg = df_all[
-                (df_all["指標"] == metric) &
-                df_all["municipality"].isin(cities) &
-                df_all["year"].between(min_year, max_year)
-            ]
-            if df_reg.empty:
+def convert_excels_to_long():
+    """data/raw/*.xlsx → data/processed/long_YYYY.csv"""
+    for fp in RAW_DIR.glob("*.xlsx"):
+        year = jp_year_to_yyyy(fp.stem)
+        if not year:
+            st.warning(f"{fp.name}: 年の判定に失敗しました。スキップします。")
+            continue
+        out = PROC_DIR / f"long_{year}.csv"
+        if out.exists():
+            st.info(f"{out.name} は既に存在します。スキップ。")
+            continue
+        
+        dfs = []
+        for table in ["accommodation_type", "scale_class", "hotel_breakdown", "residential_act"]:
+            try:
+                df = pd.read_excel(fp, sheet_name=table, header=[0, 1])
+            except ValueError:
+                st.warning(f"{fp.name}: {table} シートが見つかりません。スキップ。")
                 continue
             
-            series = df_reg.groupby("year")["value"].sum()
-            fig_reg.add_trace(
-                go.Scatter(
-                    x=series.index,
-                    y=series.values,
-                    mode="lines+markers",
-                    name=reg
-                )
-            )
-            tbl_reg[reg] = series
-
-        fig_reg.update_layout(
-            xaxis_title="年",
-            yaxis_title=metric,
-            hovermode="x unified",
-            legend=dict(
-                orientation="h",
-                y=1.02,
-                x=0.5,
-                xanchor="center"
-            ),
-            height=400
-        )
-        st.plotly_chart(fig_reg, use_container_width=True)
+            # フラット化処理
+            df = df.rename(columns={df.columns[0]: "municipality"})
+            df.columns = ["municipality"] + ["/".join(map(str, col)).replace("Unnamed: 0_level_", "").strip("/") for col in df.columns[1:]]
+            df = df.melt(id_vars="municipality", var_name="key", value_name="value")
+            
+            # key列を分解 (cat1/cat2/metric)
+            key_parts = df["key"].str.split("/", expand=True)
+            if key_parts.shape[1] == 2:  # cat1 / metric
+                key_parts[["cat1", "metric"]] = key_parts[[0, 1]]
+                key_parts["cat2"] = ""
+            elif key_parts.shape[1] == 3:
+                key_parts[["cat1", "cat2", "metric"]] = key_parts[[0, 1, 2]]
+            else:
+                key_parts = key_parts.reindex(columns=range(3)).fillna("")
+                key_parts.columns = ["cat1", "cat2", "metric"]
+            
+            df = pd.concat([df.drop(columns="key"), key_parts], axis=1)
+            df["table"] = table
+            df["year"] = year
+            dfs.append(df)
         
-        if not tbl_reg.empty:
-            st.dataframe(
-                tbl_reg.T.astype(int).style.format(thousands=","),
-                use_container_width=True
-            )
-else:
-    st.info("エリアを選択するとグラフが表示されます。")
+        if dfs:
+            long_df = pd.concat(dfs, ignore_index=True)
+            long_df.to_csv(out, index=False)
+            st.success(f"{out.name} を作成しました → {len(long_df):,} 行")
 
-# -----------------------------------------------------------------------------
-# 7. 市町村別の状況
-# -----------------------------------------------------------------------------
-st.header("市町村の状況")
-if city_sel:
-    for metric in metric_multi:
-        st.subheader(f"{metric}の推移")
-        fig_city = go.Figure()
-        df_city = df_all[
-            (df_all["指標"] == metric) &
-            df_all["municipality"].isin(city_sel) &
-            df_all["year"].between(min_year, max_year)
-        ]
+# ----------------------------
+# 2. long → clean & unify
+# ----------------------------
+def clean_long_csvs():
+    """CSVファイルを統合・クリーン化"""
+    csv_files = sorted(PROC_DIR.glob("long_*.csv"))
+    all_dfs = []
+    
+    for p in csv_files:
+        df = pd.read_csv(p)
+        # 市町村名の前後空白除去
+        df["municipality"] = df["municipality"].str.strip()
+        # エリア付与
+        df["area"] = df["municipality"].map(CITY_TO_AREA).fillna("未分類")
+        # 列名 & 順序統一
+        df = df[[
+            "year", "municipality", "area", "table", "cat1", "cat2", "metric", "value"
+        ]]
+        all_dfs.append(df)
+    
+    if not all_dfs:
+        st.error("processed ディレクトリに CSV が見つかりません。")
+        return None
+    
+    all_df = pd.concat(all_dfs, ignore_index=True)
+    out_path = UNIFY_DIR / "all_years_long.csv"
+    all_df.to_csv(out_path, index=False)
+    st.success(f"統合ファイルを作成しました → {out_path.relative_to(Path.cwd())} ({len(all_df):,} 行)")
+    return all_df
 
-        # 表示順を最終年の値で並べ替え
-        order = df_city[df_city["year"] == max_year]
-        order = order.sort_values("value", ascending=False)["municipality"].tolist()
-        
-        for city in order:
-            grp = df_city[df_city["municipality"] == city]
-            fig_city.add_trace(
-                go.Scatter(
-                    x=grp["year"],
-                    y=grp["value"],
-                    mode="lines+markers",
-                    name=city
-                )
-            )
+# ----------------------------
+# 3. Streamlit ダッシュボード
+# ----------------------------
+def streamlit_main():
+    st.set_page_config(page_title="沖縄県宿泊施設ダッシュボード", page_icon="🏨", layout="wide")
+    st.markdown("""
+    <h1 style="text-align:center;">🏨 沖縄県宿泊施設データ<br>可視化ダッシュボード</h1>
+    """, unsafe_allow_html=True)
 
-        fig_city.update_layout(
-            xaxis_title="年",
-            yaxis_title=metric,
-            hovermode="x unified",
-            height=400
-        )
-        st.plotly_chart(fig_city, use_container_width=True)
+    # データ変換処理
+    with st.expander("📥 Excel → CSV 変換を実行する", expanded=False):
+        if st.button("Excel 変換実行", key="convert"):
+            convert_excels_to_long()
+    
+    with st.expander("🔄 CSV 統合を実行する", expanded=False):
+        if st.button("統合実行", key="clean"):
+            clean_long_csvs()
 
-        tbl_city = df_city.pivot(
-            index="municipality",
-            columns="year",
-            values="value"
-        ).fillna(0).astype(int)
-        
-        st.dataframe(
-            tbl_city.style.format(thousands=","),
-            use_container_width=True
-        )
-else:
-    st.info("市町村を選択するとグラフが表示されます。")
+    # データ読み込み
+    unified_path = UNIFY_DIR / "all_years_long.csv"
+    if not unified_path.exists():
+        st.info("先に CSV の統合を実行してください。")
+        return
+    
+    df = pd.read_csv(unified_path)
+    
+    # サイドバー
+    st.sidebar.header("絞り込み条件")
+    
+    # 年度範囲
+    min_year, max_year = st.sidebar.select_slider(
+        "年度範囲",
+        options=sorted(df["year"].unique()),
+        value=(df["year"].min(), df["year"].max())
+    )
+    
+    # エリア選択
+    areas = st.sidebar.multiselect(
+        "エリア",
+        options=list(AREA_MAP.keys()),
+        default=list(AREA_MAP.keys())
+    )
+    
+    # 市町村選択
+    cities = st.sidebar.multiselect(
+        "市町村",
+        options=sorted(df["municipality"].unique()),
+        default=[]
+    )
+    
+    # 指標選択
+    metrics = st.sidebar.multiselect(
+        "指標",
+        options=list(METRIC_DISPLAY_NAMES.keys()),
+        default=["facilities"]
+    )
+    
+    # テーブル選択
+    tables = st.sidebar.multiselect(
+        "集計表",
+        options=df["table"].unique().tolist(),
+        default=df["table"].unique().tolist()
+    )
 
-# -----------------------------------------------------------------------------
-# 8. エリア定義 (フッター)
-# -----------------------------------------------------------------------------
-st.markdown("""
----  
-### エリアの内訳  
-- **南部**: 那覇市、糸満市、豊見城市、八重瀬町、南城市、与那原町、南風原町  
-- **中部**: 沖縄市、宜野湾市、浦添市、うるま市、読谷村、嘉手納町、北谷町、北中城村、中城村、西原町  
-- **北部**: 名護市、国頭村、大宜味村、東村、今帰仁村、本部町、恩納村、宜野座村、金武町  
-- **宮古**: 宮古島市、多良間村  
-- **八重山**: 石垣市、竹富町、与那国町  
-- **離島**: 久米島町、渡嘉敷村、座間味村、粟国村、渡名喜村、南大東村、北大東村、伊江村、伊平屋村、伊是名村  
-""")
+    # フィルタリング
+    q = df.query(
+        "table in @tables and metric in @metrics and year >= @min_year and year <= @max_year and area in @areas"
+    )
+    
+    if cities:
+        q = q[q["municipality"].isin(cities)]
+    
+    if q.empty:
+        st.warning("該当データがありません。サイドバーで条件を変更してください。")
+        return
+
+    # ピボットテーブル
+    st.header("ピボットテーブル (市町村 × 年)")
+    pivot = q.pivot_table(
+        index=["municipality", "area"],
+        columns="year",
+        values="value",
+        aggfunc="sum",
+        fill_value=0
+    ).reset_index()
+    
+    st.dataframe(
+        pivot.style.format(thousands=","),
+        use_container_width=True
+    )
+
+    # グラフ表示
+    st.header("市町村別推移グラフ")
+    
+    # 1軸: 軒数 (折れ線)
+    fig = go.Figure()
+    if "facilities" in metrics:
+        facilities = q[q["metric"] == "facilities"]
+        for city, g in facilities.groupby("municipality"):
+            g = g.groupby("year")["value"].sum().reset_index()
+            fig.add_trace(go.Scatter(
+                x=g["year"],
+                y=g["value"],
+                mode="lines+markers",
+                name=f"軒数: {city}",
+                line=dict(width=2),
+                yaxis="y1"
+            ))
+
+    # 2軸: 客室数/収容人数 (積み上げ棒)
+    if any(m in metrics for m in ["rooms", "capacity"]):
+        for metric in ["rooms", "capacity"]:
+            if metric not in metrics: continue
+            metric_df = q[q["metric"] == metric]
+            for city, g in metric_df.groupby("municipality"):
+                g = g.groupby("year")["value"].sum().reset_index()
+                fig.add_trace(go.Bar(
+                    x=g["year"],
+                    y=g["value"],
+                    name=f"{METRIC_DISPLAY_NAMES[metric]}: {city}",
+                    yaxis="y2"
+                ))
+
+    # グラフ設定
+    fig.update_layout(
+        title="宿泊施設推移状況",
+        xaxis_title="年",
+        yaxis=dict(
+            title="軒数（軒）",
+            titlefont=dict(color="darkblue"),
+            tickfont=dict(color="darkblue"),
+            showgrid=True
+        ),
+        yaxis2=dict(
+            title="客室数・収容人数",
+            titlefont=dict(color="cornflowerblue"),
+            tickfont=dict(color="cornflowerblue"),
+            overlaying="y",
+            side="right",
+            showgrid=False
+        ),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="center",
+            x=0.5
+        ),
+        hovermode="x unified",
+        barmode="stack",
+        height=500
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+if __name__ == "__main__":
+    streamlit_main()
