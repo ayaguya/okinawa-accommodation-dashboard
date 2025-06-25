@@ -148,8 +148,15 @@ def clean_long_csvs():
     
     all_df = pd.concat(all_dfs, ignore_index=True)
     out_path = UNIFY_DIR / "all_years_long.csv"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     all_df.to_csv(out_path, index=False)
-    st.success(f"統合ファイルを作成しました → {out_path.relative_to(Path.cwd())} ({len(all_df):,} 行)")
+
+    # --- Path 表示を安全に ---
+    try:
+        rel_path = out_path.resolve().relative_to(Path.cwd())
+    except ValueError:
+        rel_path = out_path.resolve()
+    st.success(f"統合ファイルを作成しました → {rel_path} ({len(all_df):,} 行)")
     return all_df
 
 # ----------------------------
