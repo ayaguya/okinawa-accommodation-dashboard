@@ -19,9 +19,10 @@ import pandas as pd
 import re
 import streamlit as st
 import plotly.graph_objects as go
-from app.type_map import METRIC_DISPLAY_NAMES, YEARS, YEAR_DISPLAY_NAMES, AREA_MAP
 
-# ディレクトリ設定
+# ----------------------------
+# 定数 & ディレクトリ設定
+# ----------------------------
 DATA_DIR = Path(__file__).parent / "data"
 RAW_DIR = DATA_DIR / "raw"
 PROC_DIR = DATA_DIR / "processed"
@@ -32,14 +33,37 @@ for p in (PROC_DIR, UNIFY_DIR):
     p.mkdir(parents=True, exist_ok=True)
 
 # エリアマップ
+AREA_MAP = {
+    "南部": ["那覇市", "糸満市", "豊見城市", "八重瀬町", "南城市", "与那原町", "南風原町"],
+    "中部": ["沖縄市", "宜野湾市", "浦添市", "うるま市", "読谷村", "嘉手納町", "北谷町",
+            "北中城村", "中城村", "西原町"],
+    "北部": ["名護市", "国頭村", "大宜味村", "東村", "今帰仁村", "本部町", "恩納村",
+            "宜野座村", "金武町"],
+    "宮古": ["宮古島市", "多良間村"],
+    "八重山": ["石垣市", "竹富町", "与那国町"],
+    "離島": ["久米島町", "渡嘉敷村", "座間味村", "粟国村", "渡名喜村", "南大東村",
+            "北大東村", "伊江村", "伊平屋村", "伊是名村"]
+}
+
+# エリアマップの逆引き
 CITY_TO_AREA = {city: area for area, cities in AREA_MAP.items() for city in cities}
+
+# 表示用マッピング
+METRIC_DISPLAY_NAMES = {
+    "facilities": "軒数",
+    "rooms": "客室数",
+    "capacity": "収容人数",
+}
+
+YEARS = list(range(2014, 2026))
+YEAR_DISPLAY_NAMES = {y: f"{y}年" for y in YEARS}
 
 # ----------------------------
 # 1. Excel → long 変換
 # ----------------------------
 def jp_year_to_yyyy(tag: str) -> int | None:
     """和暦/令和表記を西暦に変換"""
-    m = re.search(r"([rh])(\d{1,2})", tag.lower())
+    m = re.search(r"([rh])([0-9]{1,2})", tag.lower())
     if not m:
         return None
     era, num = m.group(1), int(m.group(2))
@@ -67,24 +91,28 @@ def convert_excels_to_long():
             
             # フラット化処理
             df = df.rename(columns={df.columns[0]: "municipality"})
-            df.columns = ["municipality"] + ["/".join(map(str, col)).replace("Unnamed: 0_level_", "").strip("/") for col in df.columns[1:]]
-            df = df.melt(id_vars="municipality", var_name="key", value_name="value")
+            flat_cols = ["municipality"] + [
+                "/".join(map(str, col)).replace("Unnamed: 0_level_", "").strip("/")
+                for col in df.columns[1:]
+            ]
+            df.columns = flat_cols
+            df_long = df.melt(id_vars="municipality", var_name="key", value_name="value")
             
             # key列を分解 (cat1/cat2/metric)
-            key_parts = df["key"].str.split("/", expand=True)
-            if key_parts.shape[1] == 2:  # cat1 / metric
-                key_parts[["cat1", "metric"]] = key_parts[[0, 1]]
-                key_parts["cat2"] = ""
-            elif key_parts.shape[1] == 3:
-                key_parts[["cat1", "cat2", "metric"]] = key_parts[[0, 1, 2]]
-            else:
-                key_parts = key_parts.reindex(columns=range(3)).fillna("")
-                key_parts.columns = ["cat1", "cat2", "metric"]
+            kparts = df_long["key"].str.split("/", expand=True)
+            if kparts.shape[1] == 2:  # cat1 / metric
+                kparts[["cat1", "metric"]] = kparts[[0, 1]]
+                kparts["cat2"] = ""
+            elif kparts.shape[1] >= 3:
+                kparts[["cat1", "cat2", "metric"]] = kparts[[0, 1, 2]]
+            else:  # 想定外
+                kparts = kparts.reindex(columns=range(3)).fillna("")
+                kparts.columns = ["cat1", "cat2", "metric"]
             
-            df = pd.concat([df.drop(columns="key"), key_parts], axis=1)
-            df["table"] = table
-            df["year"] = year
-            dfs.append(df)
+            df_long = pd.concat([df_long.drop(columns="key"), kparts], axis=1)
+            df_long["table"] = table
+            df_long["year"] = year
+            dfs.append(df_long)
         
         if dfs:
             long_df = pd.concat(dfs, ignore_index=True)
@@ -97,23 +125,26 @@ def convert_excels_to_long():
 def clean_long_csvs():
     """CSVファイルを統合・クリーン化"""
     csv_files = sorted(PROC_DIR.glob("long_*.csv"))
-    all_dfs = []
+    if not csv_files:
+        st.error("processed ディレクトリに CSV が見つかりません。まず Excel 変換を実行してください。")
+        return None
     
+    all_dfs = []
     for p in csv_files:
         df = pd.read_csv(p)
-        # 市町村名の前後空白除去
         df["municipality"] = df["municipality"].str.strip()
-        # エリア付与
         df["area"] = df["municipality"].map(CITY_TO_AREA).fillna("未分類")
-        # 列名 & 順序統一
         df = df[[
-            "year", "municipality", "area", "table", "cat1", "cat2", "metric", "value"
+            "year",
+            "municipality",
+            "area",
+            "table",
+            "cat1",
+            "cat2",
+            "metric",
+            "value",
         ]]
         all_dfs.append(df)
-    
-    if not all_dfs:
-        st.error("processed ディレクトリに CSV が見つかりません。")
-        return None
     
     all_df = pd.concat(all_dfs, ignore_index=True)
     out_path = UNIFY_DIR / "all_years_long.csv"
@@ -148,7 +179,7 @@ def streamlit_main():
     df = pd.read_csv(unified_path)
     
     # サイドバー
-    st.sidebar.header("絞り込み条件")
+    st.sidebar.header("🎛️ 絞り込み条件")
     
     # 年度範囲
     min_year, max_year = st.sidebar.select_slider(
@@ -198,7 +229,7 @@ def streamlit_main():
         return
 
     # ピボットテーブル
-    st.header("ピボットテーブル (市町村 × 年)")
+    st.header("📊 ピボットテーブル (市町村 × 年)")
     pivot = q.pivot_table(
         index=["municipality", "area"],
         columns="year",
@@ -213,7 +244,7 @@ def streamlit_main():
     )
 
     # グラフ表示
-    st.header("市町村別推移グラフ")
+    st.header("📈 市町村別推移グラフ")
     
     # 1軸: 軒数 (折れ線)
     fig = go.Figure()
