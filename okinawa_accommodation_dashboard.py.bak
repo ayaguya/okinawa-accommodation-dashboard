@@ -1,0 +1,226 @@
+"""
+# okinawa_accommodation_dashboard.py
+# =============================================================
+# 沖縄県宿泊施設ダッシュボード  (S47〜R6)
+# -------------------------------------------------------------
+#  更新 2025‑06‑26
+#  ● Transition.xlsx がヘッダ位置・名称揺れでも読めるように強化
+#    1) header=None で全行読み込み
+#    2) A 列に "total" を含む行をヘッダとみなす
+#    3) header_row 後ろのデータを tidy 変換
+"""
+from pathlib import Path
+import pandas as pd
+import streamlit as st
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+RAW_DIR = Path("data/raw")
+BY_YEAR_DIR = Path("data/processed/by_year")
+ALL_DIR = Path("data/processed/all")
+
+for p in (BY_YEAR_DIR, ALL_DIR):
+    p.mkdir(parents=True, exist_ok=True)
+
+TRANSITION_XLSX = RAW_DIR / "Transition.xlsx"
+
+# ------------------------------------------------------------
+# ヘルパー
+# ------------------------------------------------------------
+def _ensure_city_col(df: pd.DataFrame, *, src: str = "") -> pd.DataFrame:
+    """市町村列を `city` に統一。無ければ最左列を city と見なす。"""
+    df = df.loc[:, ~df.columns.str.contains(r"^Unnamed")]  # drop index col
+    for cand in df.columns:
+        if str(cand).strip().lower() in {"city", "municipality", "市町村"}:
+            if cand != "city":
+                df = df.rename(columns={cand: "city"})
+            break
+    else:
+        first = df.columns[0]
+        st.warning(f"⚠ '{src}' → '{first}' を city 列として採用")
+        df = df.rename(columns={first: "city"})
+    return df
+
+
+ALIASES = {
+    "facilities": {"facilities", "facility", "軒数"},
+    "rooms":      {"rooms", "room", "客室数"},
+    "capacity":   {"capacity", "capac", "capacit", "capaciy", "収容人数"},
+}
+
+
+def load_transition_total(path: Path) -> pd.DataFrame:
+    """Transition.xlsx (県全体推移) を柔軟に読み込み tidy で返す。
+    ・A 列に "total" を含む行をヘッダ行として採用。
+    ・英数/日本語/空白/カンマ等を正規化して数値化。
+    """
+    if not path.exists():
+        return pd.DataFrame()
+
+    xls = pd.ExcelFile(path)
+    sheet = next((s for s in xls.sheet_names if "total" in s.strip().lower()), xls.sheet_names[0])
+
+    df_raw = pd.read_excel(xls, sheet_name=sheet, header=None)
+
+    # --- ヘッダ行を自動検出 (A 列 "total") ------------------
+    header_row = df_raw[df_raw.iloc[:, 0].astype(str).str.contains("total", case=False, na=False)].index
+    if header_row.empty:
+        st.error(f"Transition.xlsx → 'total' 行が見つかりません (sheet='{sheet}')")
+        return pd.DataFrame()
+    header_idx = header_row[0]
+
+    # ヘッダ抽出 & データ切り出し
+    header = df_raw.iloc[header_idx].fillna("").astype(str).str.strip().str.lower().tolist()
+    data   = df_raw.iloc[header_idx + 1:].reset_index(drop=True)
+    data.columns = header
+
+    # year 列名を統一
+    if data.columns[0] != "year":
+        data = data.rename(columns={data.columns[0]: "year"})
+
+    # 必須列のリネーム (aliases)
+    col_map = {}
+    for std, alis in ALIASES.items():
+        for c in data.columns:
+            if str(c).strip().lower() in alis:
+                col_map[c] = std
+                break
+    data = data.rename(columns=col_map)
+
+    missing = [c for c in ["facilities", "rooms", "capacity"] if c not in data.columns]
+    if missing:
+        st.error(f"Transition.xlsx → 必須列が不足: {missing} (sheet='{sheet}')")
+        return pd.DataFrame()
+
+    # 数値化
+    for col in ["facilities", "rooms", "capacity"]:
+        data[col] = (
+            data[col].astype(str)
+                   .str.replace(r"[,　\s]", "", regex=True)
+                   .str.replace("－", "0")
+                   .pipe(pd.to_numeric, errors="coerce")
+                   .fillna(0)
+                   .astype(int)
+        )
+
+    # 和暦→西暦
+    def to_yyyy(s):
+        s = str(s).strip().upper().replace("年", "")
+        if s.startswith("S") or s.startswith("昭和"):
+            return 1925 + int(s.lstrip("S昭和"))
+        if s.startswith("H") or s.startswith("平成"):
+            return 1988 + int(s.lstrip("H平成"))
+        if s.startswith("R") or s.startswith("令和"):
+            return 2018 + int(s.lstrip("R令和"))
+        return pd.to_numeric(s, errors="coerce")
+
+    data["year"] = data["year"].apply(to_yyyy).astype(int)
+
+    tidy = data.melt(id_vars="year", var_name="metric", value_name="value")
+    tidy["city"]  = "沖縄県"
+    tidy[["table", "cat1", "cat2"]] = ["pref_transition", "total", ""]
+    return tidy
+
+# ------------------------------------------------------------
+# Streamlit
+# ------------------------------------------------------------
+def streamlit_main():
+    st.set_page_config("沖縄県宿泊施設ダッシュボード", "🏨", layout="wide")
+    st.title("沖縄県宿泊施設データ可視化アプリ")
+
+    csv_path = ALL_DIR / "all_years_long.csv"
+    if not csv_path.exists():
+        st.error("統合 CSV が見つかりません。データ更新後に再度お試しください。")
+        return
+
+    df = _ensure_city_col(pd.read_csv(csv_path, dtype={"year": int}), src=str(csv_path))
+
+    # --- Transition.xlsx を読み込み & マージ -----------------
+    df_trans = load_transition_total(TRANSITION_XLSX)
+    if not df_trans.empty:
+        # 既存の沖縄県 total データを除外してから追加
+        mask_pref = (df["city"] == "沖縄県") & (df["cat1"].str.lower() == "total")
+        df = pd.concat([df[~mask_pref], df_trans], ignore_index=True)
+
+    # value → 数値
+    df["value"] = (
+        pd.to_numeric(
+            df["value"].astype(str).str.replace(r"[\s,]", "", regex=True),
+            errors="coerce")
+          .fillna(0)
+          .astype(int)
+    )
+
+    # --- 沖縄県 total 抽出 -----------------------------------
+    mask_total = (
+        (df["city"] == "沖縄県") &
+        (df["cat1"].str.lower() == "total")
+    )
+    pivot_pref = (
+        df[mask_total]
+          .pivot_table(index="year", columns="metric", values="value", aggfunc="sum")
+          .rename(columns={"facilities": "軒数", "rooms": "客室数", "capacity": "収容人数"})
+          .sort_index()
+    )
+
+    if pivot_pref.empty:
+        st.error("表示対象データがありません。CSV と Transition.xlsx を確認してください。")
+        return
+
+    # --- 最新年メトリクス -----------------------------------
+    latest_year = int(pivot_pref.index.max())
+    latest_vals = pivot_pref.loc[latest_year]
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric(f"総施設数（{latest_year}年）", f"{latest_vals['軒数']:,} 軒")
+    c2.metric(f"総客室数（{latest_year}年）", f"{latest_vals['客室数']:,} 室")
+    c3.metric(f"総収容人数（{latest_year}年）", f"{latest_vals['収容人数']:,} 人")
+
+    # --- グラフ ----------------------------------------------
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+    fig.add_bar(
+        x=pivot_pref.index,
+        y=pivot_pref["客室数"],
+        name="客室数（室）",
+        marker_color="lightblue",
+        opacity=0.8,
+        secondary_y=False,
+        hovertemplate="客室数 %{y:,} 室<extra></extra>",
+    )
+    fig.add_bar(
+        x=pivot_pref.index,
+        y=pivot_pref["収容人数"],
+        name="収容人数（人）",
+        marker_color="cornflowerblue",
+        opacity=0.8,
+        secondary_y=False,
+        hovertemplate="収容人数 %{y:,} 人<extra></extra>",
+    )
+    fig.add_scatter(
+        x=pivot_pref.index,
+        y=pivot_pref["軒数"],
+        mode="lines+markers",
+        name="軒数（軒）",
+        line=dict(color="darkblue", width=3),
+        marker=dict(size=8),
+        secondary_y=True,
+        hovertemplate="軒数 %{y:,} 軒<extra></extra>",
+    )
+
+    fig.update_xaxes(title="年")
+    fig.update_yaxes(title_text="客室数・収容人数", secondary_y=False)
+    fig.update_yaxes(title_text="軒数（軒）", secondary_y=True)
+    fig.update_layout(
+        title=dict(text="沖縄県宿泊施設推移状況 (S47→R6, total)", x=0.5, xanchor="center"),
+        hovermode="x unified",
+        height=520,
+        margin=dict(l=60, r=40, t=80, b=50),
+        legend=dict(orientation="h", y=1.02, x=0.5, xanchor="center"),
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption("※ accommodation_type の total 行 + Transition.xlsx の total を使用。")
+
+if __name__ == "__main__":
+    streamlit_main()
